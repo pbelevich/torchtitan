@@ -8,7 +8,7 @@
 # llama model, i.e. activation checkpointing, etc.
 
 from collections import defaultdict
-from typing import Tuple
+from typing import Dict, Tuple
 
 import torch
 
@@ -17,6 +17,11 @@ from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
     CheckpointImpl,
+)
+from torch.distributed.pipelining import pipeline, SplitPoint
+from torch.distributed.pipelining._PipelineStage import (
+    _PipelineStage,
+    ManualPipelineStage,
 )
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -30,7 +35,7 @@ from torch.utils.checkpoint import _pt2_selective_checkpoint_context_fn_gen, che
 
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.logging_utils import logger
-
+from torchtitan.parallelisms.pipelining_utils import split_stage_fqns
 
 # for selective AC
 no_recompute_list = {
@@ -129,15 +134,192 @@ def get_tp_parallel_strategy(
     return RowwiseParallel, ColwiseParallel
 
 
+def _llama_fqns(num_layers):
+    return (
+        [
+            "tok_embeddings",
+        ]
+        + [f"layers.{i}" for i in range(num_layers)]
+        + [
+            "norm",
+            "output",
+        ]
+    )
+
+
+def pipeline_llama(
+    model, world_mesh, parallel_dims, job_config: JobConfig, device, model_config: Dict
+):
+    if job_config.experimental.pipeline_parallel_split_mode == "manual":
+        return pipeline_llama_manual(
+            model, world_mesh, parallel_dims, job_config, device, model_config
+        )
+    elif job_config.experimental.pipeline_parallel_split_mode == "tracer":
+        return pipeline_llama_tracer(
+            model, world_mesh, parallel_dims, job_config, device, model_config
+        )
+    else:
+        raise NotImplementedError(
+            f"{job_config.experimental.pipeline_parallel_split_mode} is not a valid split mode"
+        )
+
+
+def _llama_trace_input(job_config, model_config, device="meta"):
+    """Get meta tensors with the right input shapes used for tracing"""
+    tokens_shape = (job_config.training.batch_size, job_config.training.seq_len)
+    tokens = torch.randint(
+        model_config.vocab_size, tokens_shape, dtype=torch.int64, device=device
+    )
+    return (tokens,)
+
+
+def pipeline_llama_manual(
+    model, world_mesh, parallel_dims, job_config: JobConfig, device, model_config: Dict
+):
+    """
+    This API gets individual torch.nn.Module objects for each pipeline stage (including virtual stages).
+
+    The SPMD parallelisms should be applied to
+    """
+    pp_mesh = world_mesh["pp"]
+    pp_rank = pp_mesh.get_local_rank()
+    pp_size = pp_mesh.size()
+    microbatches = (
+        job_config.experimental.pipeline_parallel_microbatches or parallel_dims.pp
+    )
+    stage_idx = pp_rank
+    this_stage_layer_names = split_stage_fqns(
+        _llama_fqns(len(model.layers)),
+        job_config.experimental.pipeline_parallel_split_points,
+        pp_rank,
+    )
+
+    if pp_rank < pp_size - 1:
+        model.norm = None
+        model.output = None
+    if pp_rank > 0:
+        model.tok_embeddings = None
+    names = list(model.layers.keys())
+    for name in names:
+        if f"layers.{name}" not in this_stage_layer_names:
+            del model.layers[name]
+
+    logger.info(f"PP rank {pp_rank} is using this model chunk\n{model}")
+
+    # TODO(whc) once ManualPipelineStage supports lazy shape inference, we can leave model on meta device longer and
+    # get rid of the input shape hardcoded here. For now, it should not be a big deal since we only materialize the
+    # layers of the model that map to this stage, not the whole model.
+
+    if pp_rank == 0:
+        # first layer
+        input = torch.randint(
+            model_config.vocab_size,
+            size=(job_config.training.batch_size, job_config.training.seq_len),
+            dtype=torch.int64,
+            device=device,
+        )
+    else:
+        # later layers (assume all start w/ a transformer layer)
+        input = torch.rand(
+            size=(
+                job_config.training.batch_size,
+                int(job_config.training.seq_len // parallel_dims.tp),
+                model_config.dim,
+            ),
+            dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param]
+            if parallel_dims.dp_enabled
+            else torch.float32,
+            device=device,
+        )
+
+    if pp_rank == pp_size - 1:
+        # last layer
+        output = torch.rand(
+            size=(
+                job_config.training.batch_size,
+                int(job_config.training.seq_len // parallel_dims.tp),
+                model_config.vocab_size,
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        # earlier layers (assume all end in a transformer layer)
+        output = torch.rand(
+            size=(
+                job_config.training.batch_size,
+                int(job_config.training.seq_len // parallel_dims.tp),
+                model_config.dim,
+            ),
+            dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param]
+            if parallel_dims.dp_enabled
+            else torch.float32,
+            device=device,
+        )
+
+    model.to_empty(device=device)
+    stage = ManualPipelineStage(
+        model,
+        pp_rank,
+        pp_size,
+        device,
+        microbatches,
+        input_args=input.chunk(microbatches)[0],
+        output_args=output.chunk(microbatches)[0],
+        group=pp_mesh.get_group("pp"),
+    )
+    return (stage, model)
+
+
+def pipeline_llama_tracer(
+    model, world_mesh, parallel_dims, job_config: JobConfig, device, model_config: Dict
+):
+    if job_config.model.norm_type == "fused_rmsnorm":
+        # TODO(whc) - torch._dynamo.exc.Unsupported: Illegal getattr invocation stride in strict mode
+        # coming from ` if dy.stride(-1) != 1:` in fused_rmsnorm
+        raise NotImplementedError(
+            "fused_rmsnorm not yet compatible with Pipeline Tracer (strides error). Please use layernorm or rmsnorm."
+        )
+
+    # TODO(whc) maybe we can just fix this by feeding bf16 into the tracer for its input shapes?
+    raise NotImplementedError(
+        "pipeline tracer doesn't work with fsdp mixed precision currently. "
+        "To work around, edit fsdp mixed precision config to use fp32."
+    )
+    pp_mesh = world_mesh["pp"]
+    pp_rank = pp_mesh.get_local_rank()
+    stage_idx = pp_mesh.get_local_rank()
+    layers_per_rank = len(model.layers) // parallel_dims.pp
+    split_spec = {
+        f"layers.{i * layers_per_rank}": SplitPoint.BEGINNING
+        for i in range(1, parallel_dims.pp)
+    }
+
+    # Create a pipeline representation from the model
+    pipe = pipeline(
+        model,
+        job_config.experimental.pipeline_parallel_microbatches or parallel_dims.pp,
+        example_args=_llama_trace_input(job_config, model_config),
+        split_spec=split_spec,
+    )
+    model = pipe.get_stage_module(stage_idx)
+    stage = _PipelineStage(
+        stage_module=model,
+        stage_index=pp_rank,
+        pipe_info=pipe.pipe_info,
+        device=device,
+        group=pp_mesh.get_group(),
+    )
+    return (stage, model)
+
+
 def parallelize_llama(model, world_mesh, parallel_dims, job_config: JobConfig):
     """
-    Apply parallelisms and activation checkpointing to the model.
+    Apply SPMD parallelisms and activation checkpointing to the model.
 
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
     the model must fit on GPU or CPU memory.
     """
-    if parallel_dims.pp_enabled:
-        raise NotImplementedError("PP not implemented yet.")
 
     if parallel_dims.tp_enabled:
         if job_config.model.norm_type == "fused_rmsnorm":
@@ -221,15 +403,22 @@ def parallelize_llama(model, world_mesh, parallel_dims, job_config: JobConfig):
                     transformer_block, job_config.activation_checkpoint
                 )
             # As an optimization, do not reshard after forward for the last
-            # transformer block since FSDP would prefetch it immediately
-            reshard_after_forward = int(layer_id) < len(model.layers) - 1
+            # transformer block since FSDP would prefetch it immediately.
+            # When using Pipeline Parallelism, generally zero-2 is best so as to avoid repeated reshardings
+            # per microbatch.
+            reshard_after_forward = (
+                int(layer_id) < len(model.layers) - 1 and not parallel_dims.pp_enabled
+            )
             fully_shard(
                 transformer_block,
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward,
             )
             model.layers[layer_id] = transformer_block
-        model = fully_shard(model, **fsdp_config)
+
+        model = fully_shard(
+            model, **fsdp_config, reshard_after_forward=not parallel_dims.pp_enabled
+        )
         if ac_mode in ("full", "selective"):
             logger.info(f"Applied {ac_mode} activation checkpointing to the model")
         logger.info("Applied FSDP to the model")
